@@ -1,0 +1,8 @@
+name = "fragcap-worker"
+main = "src/index.js"
+compatibility_date = "2024-12-01"
+
+# Secrets (不在这里写，用 wrangler secret put 设置):
+# - APP_ID          GitHub App ID
+# - PRIVATE_KEY     GitHub App 私钥 (.pem 内容)
+# - INSTALLATION_ID GitHub App 安装到 registry repo 后的 ID
