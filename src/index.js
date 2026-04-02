@@ -45,11 +45,11 @@ async function handleRegister(request, env) {
       return json({ ok: false, error: 'Missing or invalid gist_id' }, 400);
     }
 
-    // 1. 获取 installation token
+    // 1. 获取 installation token (用于写 registry)
     const installToken = await getInstallationToken(env);
 
-    // 2. 读取 Gist 公开内容（用 install token 可以避免未认证速率限制）
-    const gist = await ghGet(`/gists/${gist_id}`, installToken);
+    // 2. 读取 Gist 公开内容（无需认证，installation token 作用域不含任意 Gist 读取）
+    const gist = await ghGet(`/gists/${gist_id}`);
     if (!gist) {
       return json({ ok: false, error: 'Gist not found' }, 404);
     }
@@ -294,15 +294,16 @@ async function importPrivateKey(pem) {
 
 // ─── GitHub API 辅助 ────────────────────────────────────
 
-async function ghGet(path, token) {
-  const res = await fetch(`${GH_API}${path}`, {
-    headers: {
-      'Authorization': `Bearer ${token}`,
-      'Accept': 'application/vnd.github+json',
-      'User-Agent': USER_AGENT,
-      'X-GitHub-Api-Version': '2022-11-28'
-    }
-  });
+async function ghGet(path, token = null) {
+  const headers = {
+    'Accept': 'application/vnd.github+json',
+    'User-Agent': USER_AGENT,
+    'X-GitHub-Api-Version': '2022-11-28'
+  };
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+  const res = await fetch(`${GH_API}${path}`, { headers });
   if (!res.ok) return null;
   return res.json();
 }
