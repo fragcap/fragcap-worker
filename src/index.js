@@ -1,8 +1,9 @@
 /**
  * FragCap Registry Worker
  *
- * 接收公开的 Gist ID → 从 GitHub 读取 Gist 内容 → 用 App installation token 写入 registry
- * 不接收任何用户凭证
+ * Accepts a public Gist ID → reads Gist content from GitHub → writes to registry using App installation token
+ * Does not accept or store any user credentials.
+ * Rate limiting is enforced per gist owner using Cloudflare KV (env.RATE_LIMIT).
  */
 
 const REGISTRY_OWNER = 'fragcap';
@@ -10,6 +11,7 @@ const REGISTRY_REPO = 'registry';
 const GH_API = 'https://api.github.com';
 const USER_AGENT = 'FragCap-Worker/0.1';
 const MAX_CAPSULES_PER_SHARD = 200;
+const RATE_LIMIT_PER_DAY = 20;
 
 // ─── Entry ───────────────────────────────────────────────
 
@@ -17,7 +19,7 @@ export default {
   async fetch(request, env) {
     // CORS preflight
     if (request.method === 'OPTIONS') {
-      return new Response(null, { status: 204, headers: corsHeaders() });
+      return new Response(null, { status: 204, headers: corsHeaders(request) });
     }
 
     const url = new URL(request.url);
@@ -41,28 +43,35 @@ async function handleRegister(request, env) {
     const body = await request.json();
     const { gist_id } = body;
 
-    if (!gist_id || typeof gist_id !== 'string') {
+    if (!gist_id || typeof gist_id !== 'string' || !/^[a-f0-9]{20,32}$/i.test(gist_id)) {
       return json({ ok: false, error: 'Missing or invalid gist_id' }, 400);
     }
 
-    // 1. 获取 installation token (用于写 registry)
+    // 1. Get installation token (used to write to registry)
     const installToken = await getInstallationToken(env);
 
-    // 2. 读取 Gist 公开内容（无需认证，installation token 作用域不含任意 Gist 读取）
+    // 2. Read public Gist content — owner identity comes from GitHub's own API response
     const gist = await ghGet(`/gists/${gist_id}`);
     if (!gist) {
       return json({ ok: false, error: 'Gist not found' }, 404);
     }
 
-    // 3. 校验 Gist 合规性
+    const owner = gist.owner.login;
+
+    // 3. Rate limit: max RATE_LIMIT_PER_DAY registrations per gist owner per UTC day
+    const rateLimitResult = await checkRateLimit(env.RATE_LIMIT, owner);
+    if (!rateLimitResult.ok) {
+      return json({ ok: false, error: rateLimitResult.error }, 429);
+    }
+
+    // 4. Validate gist compliance
     const validation = validateGist(gist);
     if (!validation.ok) {
       return json({ ok: false, error: validation.error }, 400);
     }
 
-    // 4. 提取摘要
+    // 5. Extract summary
     const capsule = JSON.parse(gist.files['capsule.json'].content);
-    const owner = gist.owner.login;
     const shardKey = await shorthash(owner);
     const summary = {
       id: capsule.id,
@@ -70,12 +79,14 @@ async function handleRegister(request, env) {
       tags: capsule.tags || [],
       problem: capsule.problem || '',
       status: capsule.status || 'open',
+      author: capsule.author || `gh:anonymous-${shardKey}`,
       summary: capsule.solution || capsule.problem || '',
       updated_at: new Date().toISOString()
     };
 
-    // 5. 写入 registry 分片
+    // 6. Write to registry shard
     const result = await upsertShard(installToken, shardKey, owner, summary, capsule.visibility);
+    if (result.ok) await incrementRateLimit(env.RATE_LIMIT, owner);
     return json(result, result.ok ? 200 : 500);
 
   } catch (err) {
@@ -84,7 +95,30 @@ async function handleRegister(request, env) {
   }
 }
 
-// ─── Gist 校验 ──────────────────────────────────────────
+// ─── Rate limiting (KV-backed, per owner per UTC day) ─────────────────────────
+
+function rateLimitKey(owner) {
+  const today = new Date().toISOString().slice(0, 10); // "YYYY-MM-DD"
+  return `rl:${owner}:${today}`;
+}
+
+async function checkRateLimit(kv, owner) {
+  const key = rateLimitKey(owner);
+  const current = parseInt(await kv.get(key) ?? '0', 10);
+  if (current >= RATE_LIMIT_PER_DAY) {
+    return { ok: false, error: `Rate limit exceeded — max ${RATE_LIMIT_PER_DAY} registrations per day` };
+  }
+  return { ok: true };
+}
+
+async function incrementRateLimit(kv, owner) {
+  const key = rateLimitKey(owner);
+  const current = parseInt(await kv.get(key) ?? '0', 10);
+  // TTL of 25 hours ensures the key expires shortly after the UTC day rolls over
+  await kv.put(key, String(current + 1), { expirationTtl: 90000 });
+}
+
+// ─── Gist validation ──────────────────────────────────────────
 
 function validateGist(gist) {
   if (!gist.public) {
@@ -97,7 +131,7 @@ function validateGist(gist) {
     return { ok: false, error: 'Gist must contain capsule.json' };
   }
 
-  // 验证 capsule.json 内容可解析
+  // Verify capsule.json content is parseable
   try {
     const capsule = JSON.parse(gist.files['capsule.json'].content);
     if (!capsule.id || !capsule.tags || !capsule.problem) {
@@ -110,16 +144,15 @@ function validateGist(gist) {
   return { ok: true };
 }
 
-// ─── Registry 分片读写 ──────────────────────────────────
+// ─── Registry shard read/write ──────────────────────────────────
 
 async function upsertShard(token, shardKey, owner, summary, visibility) {
   const path = `shards/${shardKey}.json`;
 
-  // 读取现有分片
+  // Read existing shard
   let sha = null;
   let shard = {
     version: 1,
-    author: `gh:anonymous-${shardKey}`,
     updated_at: new Date().toISOString(),
     capsules: []
   };
@@ -135,12 +168,7 @@ async function upsertShard(token, shardKey, owner, summary, visibility) {
       shard = JSON.parse(decoded);
     }
   } catch {
-    // 404 = 新用户，用空分片
-  }
-
-  // 设置 author
-  if (visibility === 'attributed') {
-    shard.author = `gh:${owner}`;
+    // 404 = new user, use empty shard
   }
 
   // Upsert capsule
@@ -155,7 +183,7 @@ async function upsertShard(token, shardKey, owner, summary, visibility) {
   }
   shard.updated_at = new Date().toISOString();
 
-  // 写回（带重试）
+  // Write back (with retry)
   for (let attempt = 0; attempt < 2; attempt++) {
     const putRes = await ghPut(
       `/repos/${REGISTRY_OWNER}/${REGISTRY_REPO}/contents/${path}`,
@@ -171,7 +199,7 @@ async function upsertShard(token, shardKey, owner, summary, visibility) {
       return { ok: true };
     }
 
-    // 409 Conflict → 重新读取 sha 再试一次
+    // 409 Conflict → re-fetch sha and retry once
     if (putRes.status === 409 && attempt === 0) {
       try {
         const fresh = await ghGet(
@@ -181,7 +209,7 @@ async function upsertShard(token, shardKey, owner, summary, visibility) {
         sha = fresh.sha;
         const decoded = atob(fresh.content.replace(/\n/g, ''));
         const freshShard = JSON.parse(decoded);
-        // 重新 upsert
+        // Re-upsert
         const fIdx = freshShard.capsules.findIndex(c => c.id === summary.id);
         if (fIdx >= 0) freshShard.capsules[fIdx] = summary;
         else freshShard.capsules.push(summary);
@@ -199,9 +227,16 @@ async function upsertShard(token, shardKey, owner, summary, visibility) {
   return { ok: false, error: 'Registry write failed after retry' };
 }
 
-// ─── GitHub App 认证 ────────────────────────────────────
+// ─── GitHub App authentication ────────────────────────────────────
+
+let cachedToken = null;
+let tokenExpiresAt = 0;
 
 async function getInstallationToken(env) {
+  if (cachedToken && Date.now() < tokenExpiresAt - 60_000) {
+    return cachedToken;
+  }
+
   const jwt = await createJWT(env.APP_ID, env.PRIVATE_KEY);
 
   const res = await fetch(
@@ -227,19 +262,21 @@ async function getInstallationToken(env) {
   }
 
   const data = await res.json();
-  return data.token;
+  cachedToken = data.token;
+  tokenExpiresAt = new Date(data.expires_at).getTime();
+  return cachedToken;
 }
 
 /**
- * 用 Web Crypto API 签发 JWT（RS256）
- * Cloudflare Workers 不支持 Node.js crypto，必须用 Web Crypto
+ * Sign a JWT (RS256) using the Web Crypto API
+ * Cloudflare Workers does not support Node.js crypto — Web Crypto must be used
  */
 async function createJWT(appId, privateKeyPem) {
   const header = { alg: 'RS256', typ: 'JWT' };
   const now = Math.floor(Date.now() / 1000);
   const payload = {
-    iat: now - 60,       // 60 秒前，允许时钟偏移
-    exp: now + 10 * 60,  // 10 分钟有效期
+    iat: now - 60,       // 60 seconds in the past to allow for clock skew
+    exp: now + 10 * 60,  // 10-minute validity
     iss: appId
   };
 
@@ -247,10 +284,10 @@ async function createJWT(appId, privateKeyPem) {
   const payloadB64 = base64url(JSON.stringify(payload));
   const signingInput = `${headerB64}.${payloadB64}`;
 
-  // 导入 PEM 私钥
+  // Import PEM private key
   const key = await importPrivateKey(privateKeyPem);
 
-  // 签名
+  // Sign
   const signature = await crypto.subtle.sign(
     'RSASSA-PKCS1-v1_5',
     key,
@@ -271,7 +308,7 @@ async function importPrivateKey(pem) {
 
   const binaryDer = Uint8Array.from(atob(pemContents), c => c.charCodeAt(0));
 
-  // 尝试 PKCS8 格式（BEGIN PRIVATE KEY）
+  // Try PKCS8 format (BEGIN PRIVATE KEY)
   try {
     return await crypto.subtle.importKey(
       'pkcs8',
@@ -281,9 +318,9 @@ async function importPrivateKey(pem) {
       ['sign']
     );
   } catch {
-    // 如果失败，可能是 PKCS1 格式（BEGIN RSA PRIVATE KEY）
-    // Cloudflare Workers 的 Web Crypto 通常支持 PKCS8
-    // GitHub 下载的 .pem 一般是 PKCS1，需要转换
+    // If that fails, it may be PKCS1 format (BEGIN RSA PRIVATE KEY)
+    // Cloudflare Workers Web Crypto generally supports PKCS8
+    // GitHub-downloaded .pem files are typically PKCS1 and must be converted
     throw new Error(
       'Failed to import private key. ' +
       'GitHub App PEM files are PKCS1 format. ' +
@@ -292,7 +329,7 @@ async function importPrivateKey(pem) {
   }
 }
 
-// ─── GitHub API 辅助 ────────────────────────────────────
+// ─── GitHub API helpers ────────────────────────────────────
 
 async function ghGet(path, token = null) {
   const headers = {
@@ -322,7 +359,7 @@ async function ghPut(path, token, body) {
   return { ok: res.ok, status: res.status };
 }
 
-// ─── 工具函数 ───────────────────────────────────────────
+// ─── Utilities ───────────────────────────────────────────
 
 function base64url(input) {
   let b64;
@@ -341,22 +378,24 @@ async function shorthash(str) {
   return [...new Uint8Array(hash)]
     .map(b => b.toString(16).padStart(2, '0'))
     .join('')
-    .slice(0, 4);
+    .slice(0, 8);
 }
 
-function json(data, status = 200) {
+function json(data, status = 200, request = null) {
   return new Response(JSON.stringify(data), {
     status,
     headers: {
       'Content-Type': 'application/json',
-      ...corsHeaders()
+      ...corsHeaders(request)
     }
   });
 }
 
-function corsHeaders() {
+function corsHeaders(request) {
+  const origin = request?.headers?.get('Origin') || '';
+  const allowed = ['https://fragcap.github.io'];
   return {
-    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Origin': allowed.includes(origin) ? origin : '',
     'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type'
   };
