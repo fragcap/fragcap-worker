@@ -29,10 +29,10 @@ export default {
     }
 
     if (url.pathname === '/health' && request.method === 'GET') {
-      return json({ ok: true, service: 'fragcap-worker' });
+      return json({ ok: true, service: 'fragcap-worker' }, 200, request);
     }
 
-    return json({ ok: false, error: 'Not found' }, 404);
+    return json({ ok: false, error: 'Not found' }, 404, request);
   }
 };
 
@@ -40,11 +40,15 @@ export default {
 
 async function handleRegister(request, env) {
   try {
+    if (!request.headers.get('content-type')?.includes('application/json')) {
+      return json({ ok: false, error: 'Content-Type must be application/json' }, 415, request);
+    }
+
     const body = await request.json();
     const { gist_id } = body;
 
     if (!gist_id || typeof gist_id !== 'string' || !/^[a-f0-9]{20,32}$/i.test(gist_id)) {
-      return json({ ok: false, error: 'Missing or invalid gist_id' }, 400);
+      return json({ ok: false, error: 'Missing or invalid gist_id' }, 400, request);
     }
 
     // 1. Get installation token (used to write to registry)
@@ -53,45 +57,47 @@ async function handleRegister(request, env) {
     // 2. Read public Gist content — owner identity comes from GitHub's own API response
     const gist = await ghGet(`/gists/${gist_id}`);
     if (!gist) {
-      return json({ ok: false, error: 'Gist not found' }, 404);
+      return json({ ok: false, error: 'Gist not found' }, 404, request);
     }
 
     const owner = gist.owner.login;
 
     // 3. Rate limit: max RATE_LIMIT_PER_DAY registrations per gist owner per UTC day
-    const rateLimitResult = await checkRateLimit(env.RATE_LIMIT, owner);
+    // Increment first to minimize TOCTOU window; decrement on failure
+    const rateLimitResult = await acquireRateLimit(env.RATE_LIMIT, owner);
     if (!rateLimitResult.ok) {
-      return json({ ok: false, error: rateLimitResult.error }, 429);
+      return json({ ok: false, error: rateLimitResult.error }, 429, request);
     }
 
     // 4. Validate gist compliance
     const validation = validateGist(gist);
     if (!validation.ok) {
-      return json({ ok: false, error: validation.error }, 400);
+      return json({ ok: false, error: validation.error }, 400, request);
     }
 
     // 5. Extract summary
     const capsule = JSON.parse(gist.files['capsule.json'].content);
     const shardKey = await shorthash(owner);
+    const truncate = (str, max) => typeof str === 'string' ? str.slice(0, max) : '';
     const summary = {
-      id: capsule.id,
+      id: truncate(capsule.id, 128),
       gist_id,
-      tags: capsule.tags || [],
-      problem: capsule.problem || '',
-      status: capsule.status || 'open',
-      author: capsule.author || `gh:anonymous-${shardKey}`,
-      summary: capsule.solution || capsule.problem || '',
+      tags: (capsule.tags || []).slice(0, 10).map(t => truncate(String(t), 50)),
+      problem: truncate(capsule.problem, 500),
+      status: ['open', 'resolved', 'abandoned'].includes(capsule.status) ? capsule.status : 'open',
+      author: truncate(capsule.author || `gh:anonymous-${shardKey}`, 64),
+      summary: truncate(capsule.solution || capsule.problem, 500),
       updated_at: new Date().toISOString()
     };
 
     // 6. Write to registry shard
     const result = await upsertShard(installToken, shardKey, owner, summary, capsule.visibility);
-    if (result.ok) await incrementRateLimit(env.RATE_LIMIT, owner);
-    return json(result, result.ok ? 200 : 500);
+    if (!result.ok) await releaseRateLimit(env.RATE_LIMIT, owner);
+    return json(result, result.ok ? 200 : 500, request);
 
   } catch (err) {
     console.error('Register error:', err);
-    return json({ ok: false, error: 'Internal error' }, 500);
+    return json({ ok: false, error: 'Internal error' }, 500, request);
   }
 }
 
@@ -102,20 +108,22 @@ function rateLimitKey(owner) {
   return `rl:${owner}:${today}`;
 }
 
-async function checkRateLimit(kv, owner) {
+async function acquireRateLimit(kv, owner) {
   const key = rateLimitKey(owner);
   const current = parseInt(await kv.get(key) ?? '0', 10);
   if (current >= RATE_LIMIT_PER_DAY) {
     return { ok: false, error: `Rate limit exceeded — max ${RATE_LIMIT_PER_DAY} registrations per day` };
   }
+  // Increment before the registry write — reduces TOCTOU window
+  await kv.put(key, String(current + 1), { expirationTtl: 90000 });
   return { ok: true };
 }
 
-async function incrementRateLimit(kv, owner) {
+async function releaseRateLimit(kv, owner) {
+  // Decrement on registry write failure to avoid consuming quota on errors
   const key = rateLimitKey(owner);
-  const current = parseInt(await kv.get(key) ?? '0', 10);
-  // TTL of 25 hours ensures the key expires shortly after the UTC day rolls over
-  await kv.put(key, String(current + 1), { expirationTtl: 90000 });
+  const current = parseInt(await kv.get(key) ?? '1', 10);
+  await kv.put(key, String(Math.max(0, current - 1)), { expirationTtl: 90000 });
 }
 
 // ─── Gist validation ──────────────────────────────────────────
@@ -132,10 +140,21 @@ function validateGist(gist) {
   }
 
   // Verify capsule.json content is parseable
+  const content = gist.files['capsule.json'].content;
+  if (content.length > 102400) {
+    return { ok: false, error: 'capsule.json exceeds maximum size (100 KB)' };
+  }
+
   try {
-    const capsule = JSON.parse(gist.files['capsule.json'].content);
+    const capsule = JSON.parse(content);
     if (!capsule.id || !capsule.tags || !capsule.problem) {
       return { ok: false, error: 'capsule.json missing required fields (id, tags, problem)' };
+    }
+    if (!Array.isArray(capsule.tags) || capsule.tags.length > 10) {
+      return { ok: false, error: 'tags must be an array with at most 10 items' };
+    }
+    if (typeof capsule.problem === 'string' && capsule.problem.length > 500) {
+      return { ok: false, error: 'problem field exceeds 500 characters' };
     }
   } catch {
     return { ok: false, error: 'capsule.json is not valid JSON' };
@@ -171,8 +190,8 @@ async function upsertShard(token, shardKey, owner, summary, visibility) {
     // 404 = new user, use empty shard
   }
 
-  // Upsert capsule
-  const idx = shard.capsules.findIndex(c => c.id === summary.id);
+  // Upsert capsule — keyed by gist_id (immutable, GitHub-controlled) to prevent spoofing
+  const idx = shard.capsules.findIndex(c => c.gist_id === summary.gist_id);
   if (idx >= 0) {
     shard.capsules[idx] = summary;
   } else {
@@ -210,7 +229,7 @@ async function upsertShard(token, shardKey, owner, summary, visibility) {
         const decoded = atob(fresh.content.replace(/\n/g, ''));
         const freshShard = JSON.parse(decoded);
         // Re-upsert
-        const fIdx = freshShard.capsules.findIndex(c => c.id === summary.id);
+        const fIdx = freshShard.capsules.findIndex(c => c.gist_id === summary.gist_id);
         if (fIdx >= 0) freshShard.capsules[fIdx] = summary;
         else freshShard.capsules.push(summary);
         freshShard.updated_at = new Date().toISOString();
@@ -257,8 +276,8 @@ async function getInstallationToken(env) {
   );
 
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Failed to get installation token: ${res.status} ${text}`);
+    // Do not include response body in error — may contain sensitive info
+    throw new Error(`Failed to get installation token: HTTP ${res.status}`);
   }
 
   const data = await res.json();
