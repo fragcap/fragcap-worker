@@ -55,7 +55,7 @@ async function handleRegister(request, env) {
     const installToken = await getInstallationToken(env);
 
     // 2. Read public Gist content — owner identity comes from GitHub's own API response
-    const gist = await ghGet(`/gists/${gist_id}`, installToken);
+    const gist = await ghGet(`/gists/${gist_id}`, env.GIST_READ_TOKEN);
     if (!gist) {
       return json({ ok: false, error: 'Gist not found' }, 404, request);
     }
