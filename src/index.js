@@ -36,6 +36,38 @@ export default {
   }
 };
 
+// ─── Frontmatter parser ──────────────────────────────────
+
+function parseFrontmatter(content) {
+  const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
+  if (!match) return { meta: {}, body: content };
+
+  const meta = {};
+  for (const line of match[1].split('\n')) {
+    const m = line.match(/^(\w[\w_-]*)\s*:\s*(.+)$/);
+    if (!m) continue;
+    let val = m[2].trim();
+    if (val.startsWith('[') && val.endsWith(']')) {
+      val = val.slice(1, -1).split(',').map(s => s.trim().replace(/^["']|["']$/g, '')).filter(Boolean);
+    } else if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+      val = val.slice(1, -1);
+    }
+    meta[m[1]] = val;
+  }
+  return { meta, body: match[2] };
+}
+
+function extractSection(body, heading) {
+  const re = new RegExp(`^##\\s+${heading.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`, 'im');
+  const match = body.match(re);
+  if (!match) return '';
+  const start = match.index + match[0].length;
+  const rest = body.slice(start);
+  const nextHeading = rest.match(/^##\s+/m);
+  const section = nextHeading ? rest.slice(0, nextHeading.index) : rest;
+  return section.trim();
+}
+
 // ─── /register ───────────────────────────────────────────
 
 async function handleRegister(request, env) {
@@ -63,7 +95,6 @@ async function handleRegister(request, env) {
     const owner = gist.owner.login;
 
     // 3. Rate limit: max RATE_LIMIT_PER_DAY registrations per gist owner per UTC day
-    // Increment first to minimize TOCTOU window; decrement on failure
     const rateLimitResult = await acquireRateLimit(env.RATE_LIMIT, owner);
     if (!rateLimitResult.ok) {
       return json({ ok: false, error: rateLimitResult.error }, 429, request);
@@ -75,23 +106,28 @@ async function handleRegister(request, env) {
       return json({ ok: false, error: validation.error }, 400, request);
     }
 
-    // 5. Extract summary
-    const capsule = JSON.parse(gist.files['capsule.json'].content);
+    // 5. Extract summary from SKILL.md frontmatter and body
+    const content = gist.files['SKILL.md'].content;
+    const { meta, body: mdBody } = parseFrontmatter(content);
     const shardKey = await shorthash(owner);
     const truncate = (str, max) => typeof str === 'string' ? str.slice(0, max) : '';
+
+    const problem = (meta.description || '').replace(/\\"/g, '"');
+    const solution = extractSection(mdBody, 'Fix') || extractSection(mdBody, 'Solution');
+
     const summary = {
-      id: truncate(capsule.id, 128),
+      id: truncate(meta.id || gist_id, 128),
       gist_id,
-      tags: (capsule.tags || []).slice(0, 10).map(t => truncate(String(t), 50)),
-      problem: truncate(capsule.problem, 500),
-      status: ['open', 'resolved', 'abandoned'].includes(capsule.status) ? capsule.status : 'open',
-      author: truncate(capsule.author || `gh:anonymous-${shardKey}`, 64),
-      summary: truncate(capsule.solution || capsule.problem, 500),
+      tags: (Array.isArray(meta.tags) ? meta.tags : []).slice(0, 10).map(t => truncate(String(t), 50)),
+      problem: truncate(problem, 500),
+      status: ['open', 'resolved', 'abandoned'].includes(meta.status) ? meta.status : 'open',
+      author: truncate(meta.author || `gh:anonymous-${shardKey}`, 64),
+      summary: truncate(solution || problem, 500),
       updated_at: new Date().toISOString()
     };
 
     // 6. Write to registry shard
-    const result = await upsertShard(installToken, shardKey, owner, summary, capsule.visibility);
+    const result = await upsertShard(installToken, shardKey, owner, summary, meta.visibility);
     if (!result.ok) await releaseRateLimit(env.RATE_LIMIT, owner);
     return json(result, result.ok ? 200 : 500, request);
 
@@ -104,7 +140,7 @@ async function handleRegister(request, env) {
 // ─── Rate limiting (KV-backed, per owner per UTC day) ─────────────────────────
 
 function rateLimitKey(owner) {
-  const today = new Date().toISOString().slice(0, 10); // "YYYY-MM-DD"
+  const today = new Date().toISOString().slice(0, 10);
   return `rl:${owner}:${today}`;
 }
 
@@ -114,13 +150,11 @@ async function acquireRateLimit(kv, owner) {
   if (current >= RATE_LIMIT_PER_DAY) {
     return { ok: false, error: `Rate limit exceeded — max ${RATE_LIMIT_PER_DAY} registrations per day` };
   }
-  // Increment before the registry write — reduces TOCTOU window
   await kv.put(key, String(current + 1), { expirationTtl: 90000 });
   return { ok: true };
 }
 
 async function releaseRateLimit(kv, owner) {
-  // Decrement on registry write failure to avoid consuming quota on errors
   const key = rateLimitKey(owner);
   const current = parseInt(await kv.get(key) ?? '1', 10);
   await kv.put(key, String(Math.max(0, current - 1)), { expirationTtl: 90000 });
@@ -135,29 +169,26 @@ function validateGist(gist) {
   if (!gist.description || !gist.description.includes('[fragcap]')) {
     return { ok: false, error: 'Gist description must contain [fragcap]' };
   }
-  if (!gist.files || !gist.files['capsule.json']) {
-    return { ok: false, error: 'Gist must contain capsule.json' };
+  if (!gist.files || !gist.files['SKILL.md']) {
+    return { ok: false, error: 'Gist must contain SKILL.md' };
   }
 
-  // Verify capsule.json content is parseable
-  const content = gist.files['capsule.json'].content;
+  const content = gist.files['SKILL.md'].content;
   if (content.length > 102400) {
-    return { ok: false, error: 'capsule.json exceeds maximum size (100 KB)' };
+    return { ok: false, error: 'SKILL.md exceeds maximum size (100 KB)' };
   }
 
-  try {
-    const capsule = JSON.parse(content);
-    if (!capsule.id || !capsule.tags || !capsule.problem) {
-      return { ok: false, error: 'capsule.json missing required fields (id, tags, problem)' };
-    }
-    if (!Array.isArray(capsule.tags) || capsule.tags.length > 10) {
-      return { ok: false, error: 'tags must be an array with at most 10 items' };
-    }
-    if (typeof capsule.problem === 'string' && capsule.problem.length > 500) {
-      return { ok: false, error: 'problem field exceeds 500 characters' };
-    }
-  } catch {
-    return { ok: false, error: 'capsule.json is not valid JSON' };
+  // Validate frontmatter
+  const { meta } = parseFrontmatter(content);
+  if (!meta.id || !meta.tags || !meta.description) {
+    return { ok: false, error: 'SKILL.md frontmatter missing required fields (id, tags, description)' };
+  }
+  const tags = Array.isArray(meta.tags) ? meta.tags : [];
+  if (tags.length > 10) {
+    return { ok: false, error: 'tags must have at most 10 items' };
+  }
+  if (typeof meta.description === 'string' && meta.description.length > 500) {
+    return { ok: false, error: 'description field exceeds 500 characters' };
   }
 
   return { ok: true };
@@ -172,7 +203,6 @@ function utf8ToBase64(str) {
 async function upsertShard(token, shardKey, owner, summary, visibility) {
   const path = `shards/${shardKey}.json`;
 
-  // Read existing shard
   let sha = null;
   let shard = {
     version: 1,
@@ -194,7 +224,6 @@ async function upsertShard(token, shardKey, owner, summary, visibility) {
     // 404 = new user, use empty shard
   }
 
-  // Upsert capsule — keyed by gist_id (immutable, GitHub-controlled) to prevent spoofing
   const idx = shard.capsules.findIndex(c => c.gist_id === summary.gist_id);
   if (idx >= 0) {
     shard.capsules[idx] = summary;
@@ -206,7 +235,6 @@ async function upsertShard(token, shardKey, owner, summary, visibility) {
   }
   shard.updated_at = new Date().toISOString();
 
-  // Write back (with retry)
   for (let attempt = 0; attempt < 2; attempt++) {
     const putRes = await ghPut(
       `/repos/${REGISTRY_OWNER}/${REGISTRY_REPO}/contents/${path}`,
@@ -222,7 +250,6 @@ async function upsertShard(token, shardKey, owner, summary, visibility) {
       return { ok: true };
     }
 
-    // 409 Conflict → re-fetch sha and retry once
     if (putRes.status === 409 && attempt === 0) {
       try {
         const fresh = await ghGet(
@@ -232,7 +259,6 @@ async function upsertShard(token, shardKey, owner, summary, visibility) {
         sha = fresh.sha;
         const decoded = atob(fresh.content.replace(/\n/g, ''));
         const freshShard = JSON.parse(decoded);
-        // Re-upsert
         const fIdx = freshShard.capsules.findIndex(c => c.gist_id === summary.gist_id);
         if (fIdx >= 0) freshShard.capsules[fIdx] = summary;
         else freshShard.capsules.push(summary);
@@ -280,7 +306,6 @@ async function getInstallationToken(env) {
   );
 
   if (!res.ok) {
-    // Do not include response body in error — may contain sensitive info
     throw new Error(`Failed to get installation token: HTTP ${res.status}`);
   }
 
@@ -290,16 +315,12 @@ async function getInstallationToken(env) {
   return cachedToken;
 }
 
-/**
- * Sign a JWT (RS256) using the Web Crypto API
- * Cloudflare Workers does not support Node.js crypto — Web Crypto must be used
- */
 async function createJWT(appId, privateKeyPem) {
   const header = { alg: 'RS256', typ: 'JWT' };
   const now = Math.floor(Date.now() / 1000);
   const payload = {
-    iat: now - 60,       // 60 seconds in the past to allow for clock skew
-    exp: now + 10 * 60,  // 10-minute validity
+    iat: now - 60,
+    exp: now + 10 * 60,
     iss: appId
   };
 
@@ -307,10 +328,8 @@ async function createJWT(appId, privateKeyPem) {
   const payloadB64 = base64url(JSON.stringify(payload));
   const signingInput = `${headerB64}.${payloadB64}`;
 
-  // Import PEM private key
   const key = await importPrivateKey(privateKeyPem);
 
-  // Sign
   const signature = await crypto.subtle.sign(
     'RSASSA-PKCS1-v1_5',
     key,
@@ -331,7 +350,6 @@ async function importPrivateKey(pem) {
 
   const binaryDer = Uint8Array.from(atob(pemContents), c => c.charCodeAt(0));
 
-  // Try PKCS8 format (BEGIN PRIVATE KEY)
   try {
     return await crypto.subtle.importKey(
       'pkcs8',
@@ -341,9 +359,6 @@ async function importPrivateKey(pem) {
       ['sign']
     );
   } catch {
-    // If that fails, it may be PKCS1 format (BEGIN RSA PRIVATE KEY)
-    // Cloudflare Workers Web Crypto generally supports PKCS8
-    // GitHub-downloaded .pem files are typically PKCS1 and must be converted
     throw new Error(
       'Failed to import private key. ' +
       'GitHub App PEM files are PKCS1 format. ' +
@@ -392,7 +407,6 @@ function base64url(input) {
   if (typeof input === 'string') {
     b64 = btoa(input);
   } else {
-    // ArrayBuffer
     b64 = btoa(String.fromCharCode(...new Uint8Array(input)));
   }
   return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');

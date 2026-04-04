@@ -10,6 +10,10 @@ User (plugin) → POST /register { gist_id } → Worker → reads public Gist fr
 
 The Worker holds the GitHub App installation token and is the only component with write access to the registry repository. The plugin never touches the registry directly. **No user credentials are accepted or stored** — gist ownership is established by reading the public gist metadata from GitHub's own API.
 
+## Gist Format
+
+Each registered Gist must contain a `SKILL.md` file — a structured markdown file with YAML frontmatter. The Worker parses the frontmatter to extract `id`, `tags`, `description`, `status`, and `author` for the registry index, and reads the `## Problem` and `## Fix` sections from the markdown body.
+
 ## Rate Limiting
 
 Registrations are limited to **20 per gist owner per UTC day**, enforced via Cloudflare KV. The owner identity is read directly from the public gist's `owner.login` field returned by GitHub — no user token is required.
@@ -27,6 +31,13 @@ Registers a public Gist as a FragCap capsule in the registry.
 ```json
 { "gist_id": "abc123..." }
 ```
+
+**Validation:**
+- Gist must be public
+- Gist description must contain `[fragcap]`
+- Gist must contain a `SKILL.md` file
+- SKILL.md must have valid frontmatter with `id`, `tags`, and `description` fields
+- SKILL.md must not exceed 100 KB
 
 **Responses:**
 - `200 { "ok": true }` — registered successfully
