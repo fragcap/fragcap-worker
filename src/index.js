@@ -95,6 +95,7 @@ async function handleRegister(request, env) {
     const owner = gist.owner.login;
 
     // 3. Rate limit: max RATE_LIMIT_PER_DAY registrations per gist owner per UTC day
+    // Increment first to minimize TOCTOU window; decrement on failure
     const rateLimitResult = await acquireRateLimit(env.RATE_LIMIT, owner);
     if (!rateLimitResult.ok) {
       return json({ ok: false, error: rateLimitResult.error }, 429, request);
@@ -150,11 +151,13 @@ async function acquireRateLimit(kv, owner) {
   if (current >= RATE_LIMIT_PER_DAY) {
     return { ok: false, error: `Rate limit exceeded — max ${RATE_LIMIT_PER_DAY} registrations per day` };
   }
+  // Increment before the registry write — reduces TOCTOU window
   await kv.put(key, String(current + 1), { expirationTtl: 90000 });
   return { ok: true };
 }
 
 async function releaseRateLimit(kv, owner) {
+  // Decrement on registry write failure to avoid consuming quota on errors
   const key = rateLimitKey(owner);
   const current = parseInt(await kv.get(key) ?? '1', 10);
   await kv.put(key, String(Math.max(0, current - 1)), { expirationTtl: 90000 });
@@ -306,6 +309,7 @@ async function getInstallationToken(env) {
   );
 
   if (!res.ok) {
+    // Do not include response body in error — may contain sensitive info
     throw new Error(`Failed to get installation token: HTTP ${res.status}`);
   }
 
@@ -315,12 +319,16 @@ async function getInstallationToken(env) {
   return cachedToken;
 }
 
+/**
+ * Sign a JWT (RS256) using the Web Crypto API.
+ * Cloudflare Workers does not support Node.js crypto — Web Crypto must be used.
+ */
 async function createJWT(appId, privateKeyPem) {
   const header = { alg: 'RS256', typ: 'JWT' };
   const now = Math.floor(Date.now() / 1000);
   const payload = {
-    iat: now - 60,
-    exp: now + 10 * 60,
+    iat: now - 60,       // 60 seconds in the past to allow for clock skew
+    exp: now + 10 * 60,  // 10-minute validity
     iss: appId
   };
 
@@ -350,6 +358,7 @@ async function importPrivateKey(pem) {
 
   const binaryDer = Uint8Array.from(atob(pemContents), c => c.charCodeAt(0));
 
+  // Try PKCS8 format (BEGIN PRIVATE KEY)
   try {
     return await crypto.subtle.importKey(
       'pkcs8',
@@ -359,6 +368,9 @@ async function importPrivateKey(pem) {
       ['sign']
     );
   } catch {
+    // If that fails, it may be PKCS1 format (BEGIN RSA PRIVATE KEY)
+    // Cloudflare Workers Web Crypto generally supports PKCS8
+    // GitHub-downloaded .pem files are typically PKCS1 and must be converted
     throw new Error(
       'Failed to import private key. ' +
       'GitHub App PEM files are PKCS1 format. ' +
