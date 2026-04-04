@@ -165,6 +165,10 @@ function validateGist(gist) {
 
 // ─── Registry shard read/write ──────────────────────────────────
 
+function utf8ToBase64(str) {
+  return btoa(String.fromCharCode(...new TextEncoder().encode(str)));
+}
+
 async function upsertShard(token, shardKey, owner, summary, visibility) {
   const path = `shards/${shardKey}.json`;
 
@@ -209,7 +213,7 @@ async function upsertShard(token, shardKey, owner, summary, visibility) {
       token,
       {
         message: `update shard ${shardKey}`,
-        content: btoa(JSON.stringify(shard, null, 2)),
+        content: utf8ToBase64(JSON.stringify(shard, null, 2)),
         ...(sha ? { sha } : {})
       }
     );
